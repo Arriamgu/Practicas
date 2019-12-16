@@ -1,0 +1,555 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+using libzkfpcsharp;                    //Libreria ZKTecho Biometrico ZK9500
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+using System.IO;
+using Sample;
+using System.Drawing;    
+
+namespace Machine_Control_Access
+{
+    public class ZKTecho_Biometrico_Clase
+    {
+        /// <summary>
+        /// Codigo necesario para poder comunicar por medio de USB con el dispositivo
+        /// </summary>
+        [DllImport("user32.dll", EntryPoint = "SendMessageA")]
+        private static extern int SendMessage(IntPtr hwnd, int wMsg, IntPtr wParam, IntPtr lParam);
+
+        #region Codigos de Error y Parametrización
+
+        private struct CodigosDeParametrizacion
+        {
+            public static int R_O_Img_Width         = 1,
+                              R_O_Img_Height        = 2,
+                              R_W_Img_DPI           = 3,
+                              W_O_Light_Blink_Off   = 101, /*102, 103, 104*/
+                              R_O_Img_Data_Size     = 106,
+                              R_W_AntiFake_Fun      = 2002,
+                              R_O_FP_Img_True       = 2004;
+
+        }
+
+        private enum CodigosZKTecho
+        {
+            INITIALIZED = 1,
+            OPERATION_SUCCEEDED = 0,
+            INIT_FAILED_ALGORITHM = -1,
+            INIT_FAILED_CAPTURE = -2,
+            NO_DEVICE_CONNECTED = -3,
+            DEVICE_NOT_SUPPORTED = -4,
+            INVALID_PARAMETER = -5,
+            STARTING_DEVICE_FAILED = -6,
+            INVALID_HANDLE = -7,
+            IMG_CAPTURE_FAILD = -8,
+            TEMPLATE_FAILED = -9,
+            SUSPENSION = -10,
+            NO_MEMORY = -11,
+            DEVICE_BUSY = -12,
+            ADDING_FP_ERROR = -13,
+            DELETING_FP_ERROR = -14,
+            OPERATION_FAILED = -17,
+            CAPTURE_CANCELLED = -18,
+            FP_COMPARISON_FAILED = -20,
+            FP_COMBINATION_FAILED = -22,
+            DEVICE_NO_STARTED = -23,
+            NOT_INITIALIZED = -24,
+            DEVICE_STARTED = -25
+        }
+        #endregion
+
+        #region Variables y Constantes
+
+        private const int NUMERO_REPETICIONES_HUELLA = 3;   //Cantidad de veces que se repetirá la huella a enrolar. Se recomienda el uso maximo de 3
+        public const int MESSAGE_CAPTURED_OK = 0x0400 + 6;
+
+        private string sCodigoDeError;
+
+        bool    bIniciaCaptura  = false,        //Variable que permite iniciar la captura de Huellas digitales
+                //bRegistrarFP    = false,        //Variable para seleccionar modo: "Registrar Huellas"
+                bIdentificaFP   = true;         //Variable para seleccionar modo: "Identificar Huella"
+
+        int     iAnchoFP        = 0,            //Ancho del BitMap de la huella dactilar (acorde al dispositivo)
+                iAltoFP         = 0,            //Alto del BitMap de la huella dactilar (acorde al dispositivo)
+                iDPIFP          = 0,            //DPI del BitMap de la huella dactilar (acorde al dispositivo)
+                iIdRegistradoFP = 0,            //ID registrado en la base de datos del dispositivo de la huella digital
+                iIdConsecutivoFP= 1,            //Número ID consecutivo de la huella digital. Se incrementa cada que se agrega una huella en la BD del dispositivo
+                iCalidadFP      = 0,            //Calificacion de calidad de la huella capturada
+                iTamanoCapturaTmp= 2048,        //Cantidad de registros a considerar en la captura
+                iRegTmpTamanoCapturado= 0,      //Registro Temporal del Tamaño Capturado de la huella digital
+                iResultadoConsulta,             //Resultado de una solicitud del dispositivo ZKTecho
+                iContRepetirFP,                 //Contador para repetir la huella y registrarla
+                iDevice,                        //Contador de dispositivo ciclo for,
+                iSize;                          //Tamaño  de los parámetros recibidos (GetParameter)
+                
+        byte[][] byRegistarHuella = new byte[3][]; //Array para registrar una huella tres veces
+
+        byte[]  byBufferImagenFP,
+                byTemplateCapturadoFP = new byte[2048],     //Template capturado de la huella digital
+                byRegTmpTemplateCapturado = new byte[2048], //Array Temporal del Template Capturado de la huella digital combinada
+                byParameterValues = new byte[4];            //Parametros recibidos desde biométrico (GetParameters)
+        
+        IntPtr  ipDevHandle     = IntPtr.Zero,  //Maneja la conexión con el dispositivo
+                ipDBHandle      = IntPtr.Zero,  //Maneja la conexión de la base de datos del dispositivo
+                ipFormHandle    = IntPtr.Zero;  //Maneja la interacción entre la interfaz y el dispositivo
+
+        String  strBase64;
+
+        Thread CaptureThread;                   //Hilo de segundo plano para manejar la captura de huella digital
+
+        /// <summary>
+        /// Propiedad iamgen de huella digital. Contiene la imagen de la huella digital en formato Bitmap
+        /// </summary>
+        public Bitmap bmImagenFingerPrint { set; get; }
+        /// <summary>
+        /// Propiedad template de huella digital. Cadena de caracteres que contiene la huella digital
+        /// </summary>
+        public String StrFingerPrintTemplate { set; get; }
+        /// <summary>
+        /// Bandera de acción finalizada. Imagen y Template capturado. Se debe colocar en "FALSE" después de su uso
+        /// </summary>
+        public bool bFlagImgTemplateCapturado { set; get; }
+        public bool bRegistrarFP { set; get; }
+        /// <summary>
+        /// Ancho del BitMap de la huella dactilar (acorde al dispositivo)
+        /// </summary>
+        public int iWidthFP { set; get; }
+        /// <summary>
+        /// Alto del BitMap de la huella dactilar (acorde al dispositivo)
+        /// </summary>
+        public int iHeightFP { set; get; } 
+        /// <summary>
+        /// DPI del BitMap de la huella dactilar (acorde al dispositivo)
+        /// </summary>
+        public int iDpiFP { set; get; }
+        /// <summary>
+        /// Número de Biometricos ZKTecho conectados
+        /// </summary>
+        public int iDispositivosEncontrados { set; get; }
+        /// <summary>
+        /// Obtiene el número de los dispositivos conectados
+        /// </summary>
+        public int[] iDispositivosConectados { set; get; }
+        /// <summary>
+        /// Mensaje de ejecución de comandos
+        /// </summary>
+        public string sMensajeStatus { set; get; }
+
+        #endregion
+
+        #region Constructor
+
+        public ZKTecho_Biometrico_Clase(IntPtr FormHandle)
+        {
+            bFlagImgTemplateCapturado = false;
+            iDispositivosConectados = new int[10];
+            ipFormHandle = FormHandle;
+        }
+
+        #endregion
+
+        #region Métodos
+
+        /// <summary>
+        /// Regresa la descripción del código de error del Biométrico ZKTecho ZK9500
+        /// </summary>
+        /// <param name="CodigoError">Codigo de error tipo "Int"</param>
+        /// <returns>Descripción del error en tipo String</returns>
+        private string DescripcionDeCodigos(CodigosZKTecho CodigoZKTecho)
+        {
+            switch (CodigoZKTecho)
+            {
+                case CodigosZKTecho.INITIALIZED:
+                        sCodigoDeError = "Inicializado";
+                    break;
+
+                case CodigosZKTecho.OPERATION_SUCCEEDED:
+                    sCodigoDeError = "Operación exitosa";
+                    break;
+
+                case CodigosZKTecho.INIT_FAILED_ALGORITHM:
+                    sCodigoDeError = "Error al inizializar el algoritmo de la liberia";
+                    break;
+
+                case CodigosZKTecho.INIT_FAILED_CAPTURE:
+                    sCodigoDeError = "Error al inizializar la captura de la liberia";
+                    break;
+
+                case CodigosZKTecho.NO_DEVICE_CONNECTED:
+                    sCodigoDeError = "No se ha detectado un dispositivo conectado";
+                    break;
+
+                case CodigosZKTecho.DEVICE_NOT_SUPPORTED:
+                    sCodigoDeError = "Dispositivo no soportado por la interfaz";
+                    break;
+
+                case CodigosZKTecho.INVALID_PARAMETER:
+                    sCodigoDeError = "Parametro inválido para el dispositivo";
+                    break;
+
+                case CodigosZKTecho.STARTING_DEVICE_FAILED:
+                    sCodigoDeError = "Problema al iniciar el dispositivo";
+                    break;
+
+                case CodigosZKTecho.INVALID_HANDLE:
+                    sCodigoDeError = "\"Handle\" inválido";
+                    break;
+
+               case CodigosZKTecho.IMG_CAPTURE_FAILD:
+                    sCodigoDeError = "Error al capturar imagen de huella digital";
+                    break;
+
+               case CodigosZKTecho.TEMPLATE_FAILED:
+                    sCodigoDeError = "Error al extraer el \"template\" de la huella digital capturada";
+                    break;
+
+               case CodigosZKTecho.SUSPENSION:
+                    sCodigoDeError = "Dispositivo en suspención";
+                    break;
+
+               case CodigosZKTecho.NO_MEMORY:
+                    sCodigoDeError = "Memoria insuficiente en el dispositivo, elimine algunos registros de éste";
+                    break;
+
+               case CodigosZKTecho.DEVICE_BUSY:
+                    sCodigoDeError = "Dispositivo ocupado en alguna tarea";
+                    break;
+
+               case CodigosZKTecho.ADDING_FP_ERROR:
+                    sCodigoDeError = "Problema al agregar el \"template\" de la huella digital a la base de datos del dispositivo";
+                    break;
+
+               case CodigosZKTecho.DELETING_FP_ERROR:
+                    sCodigoDeError = "Problema al eliminar el \"template\" de la huella digital de la base de datos del dispositivo";
+                    break;
+               
+                case CodigosZKTecho.OPERATION_FAILED:
+                    sCodigoDeError = "Operación solicitada fallida";
+                    break;
+
+                case CodigosZKTecho.CAPTURE_CANCELLED:
+                    sCodigoDeError = "Captura de huella digital cancelada";
+                    break;
+
+                case CodigosZKTecho.FP_COMPARISON_FAILED:
+                    sCodigoDeError = "Comparación de huellas digitales fallida";
+                    break;
+
+                case CodigosZKTecho.FP_COMBINATION_FAILED:
+                    sCodigoDeError = "Error al intentar combinar las huellas digitales";
+                    break;
+                          
+                case CodigosZKTecho.DEVICE_NO_STARTED:
+                    sCodigoDeError = "El dispositivo no fue iniciado (abierto)";
+                    break;
+
+                case CodigosZKTecho.NOT_INITIALIZED:
+                    sCodigoDeError = "El dispositivo no fue iniciado adecuadamente";
+                    break;
+
+                case CodigosZKTecho.DEVICE_STARTED:
+                    sCodigoDeError = "Dispositivo iniciado (abierto)";
+                    break;
+            }
+
+            return sCodigoDeError;
+        }
+
+        /// <summary>
+        /// Inicializa el dispositivo de huella digital.
+        /// Devuelve en el número de dispositivos encontrados en la propiedad *iDispositivosEncontrados*
+        /// Devuelve el número de dispositivos con los que es posible conectarse en la propiedad int[] *iDispositivosConectados*
+        /// </summary>
+        public void InitFingerPrint()
+        {
+            if ((iResultadoConsulta = zkfp2.Init()) == zkfp.ZKFP_ERR_OK)    //si no hay error en la conexión
+            {
+                iDispositivosEncontrados = zkfp2.GetDeviceCount() - 1;
+
+                if (iDispositivosEncontrados > 0)
+                {
+                    for (iDevice = 0; iDevice <= iDispositivosEncontrados; iDevice++)
+                    {
+                        iDispositivosConectados[iDevice] = iDevice;
+                    }
+
+                    sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Dispositivo iniciado correctamente";
+                }
+                else
+                {
+                    zkfp2.Terminate();
+
+                    sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " No se encontró ningún dispositivo";
+                }
+            }
+            else
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Error al iniciar dispositivo. Error: " + DescripcionDeCodigos((CodigosZKTecho)Enum.ToObject(typeof(CodigosZKTecho), iResultadoConsulta)); 
+            }
+        }
+
+        /// <summary>
+        /// Conecta con el dispositivo Finger Print 
+        /// </summary>
+        public void ConectarDispositivoFP(int Dispositivo)
+        {
+            ipDevHandle = zkfp2.OpenDevice(Dispositivo);
+            ipDBHandle = zkfp2.DBInit();
+
+            if (ipDevHandle == IntPtr.Zero)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Error al comunicar con dispositivo";
+
+                return;
+            }
+
+            if (ipDBHandle == IntPtr.Zero)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Error al comunicar con base de datos del dispositivo";
+                zkfp2.CloseDevice(ipDevHandle);
+
+                ipDevHandle = IntPtr.Zero;
+
+                return;
+            }
+
+            for(int i = 0; i < 3; i++)
+            {
+                byRegistarHuella[i] = new byte[2048];
+            }
+
+            iSize = 4;
+
+            zkfp2.GetParameters(ipDevHandle, CodigosDeParametrizacion.R_O_Img_Width, byParameterValues, ref iSize);
+            zkfp2.ByteArray2Int(byParameterValues, ref iAnchoFP);
+            iWidthFP = iAnchoFP;
+
+            iSize = 4;
+            zkfp2.GetParameters(ipDevHandle, CodigosDeParametrizacion.R_O_Img_Height, byParameterValues, ref iSize);
+            zkfp2.ByteArray2Int(byParameterValues, ref iAltoFP);
+            iHeightFP = iAltoFP;
+
+            byBufferImagenFP = new byte[iAltoFP * iAnchoFP];
+
+            iSize = 4;
+            zkfp2.GetParameters(ipDevHandle, CodigosDeParametrizacion.R_W_Img_DPI, byParameterValues, ref iSize);
+            zkfp2.ByteArray2Int(byParameterValues, ref iDPIFP);
+            iDpiFP = iDPIFP;
+
+            sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Parametros del lector. Alto: " + iAltoFP + " Ancho: " + iAnchoFP + " DPI: " + iDPIFP + Environment.NewLine + "Conectado exitosamente";
+
+            CaptureThread = new Thread(new ThreadStart(CapturaFingerPrint));
+            CaptureThread.IsBackground = true;
+            CaptureThread.Start();
+
+            bIniciaCaptura = true;
+        }
+
+        /// <summary>
+        /// Termina la comunicación con el dispositivo y la recepción de datos
+        /// </summary>
+        /// <param name="Dispositivo"></param>
+        public void DesconectarDispositivo(int Dispositivo)
+        {
+            bIniciaCaptura = false;
+
+            CaptureThread.Abort();
+
+            zkfp2.CloseDevice(ipDevHandle);
+        }
+
+        /// <summary>
+        /// Obtiene la imagen en fomato BMP y Template de huella digital.
+        /// Guarda BMP en propiedad Bitmap *bmImagenFingerPrint*.
+        /// Guarda Template en propiedad String *StrFingerPrintTemplate*
+        /// </summary>
+        public void CapturaImagenTemplate()
+        {
+            if (!bFlagImgTemplateCapturado)
+            {
+                MemoryStream myMemStream = new MemoryStream();
+
+                //Convierte el buffer recibido en una imagen BMP
+                BitmapFormat.GetBitmap(byBufferImagenFP, iAnchoFP, iAltoFP, ref myMemStream);
+
+                bmImagenFingerPrint = new Bitmap(myMemStream);
+
+                //Obtiene el el string de la huella digital capturada. Convierte el arreglo en un string
+                StrFingerPrintTemplate = zkfp2.BlobToBase64(byTemplateCapturadoFP, iRegTmpTamanoCapturado);
+
+                bFlagImgTemplateCapturado = true;
+            }
+        }
+
+        /// <summary>
+        /// Enrola una huella digital
+        /// </summary>
+        public void RegistrarFingerPrint()
+        {
+            iIdRegistradoFP = 0; iCalidadFP = 0;
+
+            iResultadoConsulta = zkfp2.DBIdentify(ipDBHandle, byTemplateCapturadoFP, ref iIdRegistradoFP, ref iCalidadFP);
+
+            if (iResultadoConsulta == zkfp.ZKFP_ERR_OK)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Huella registrada con el ID: " + iIdRegistradoFP;
+
+                return;
+            }
+
+            if(iContRepetirFP > 0 && zkfp2.DBMatch(ipDBHandle, byTemplateCapturadoFP, byRegistarHuella[iContRepetirFP -1]) <= 0)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Colocar huella 3 veces";
+
+                return;
+            }
+
+            Array.Copy(byTemplateCapturadoFP, byRegistarHuella[iContRepetirFP], iTamanoCapturaTmp);
+
+            strBase64 = zkfp2.BlobToBase64(byTemplateCapturadoFP, iTamanoCapturaTmp);
+            byte[] blob = zkfp2.Base64ToBlob(strBase64);
+
+            iContRepetirFP++;
+
+            if (iContRepetirFP >= NUMERO_REPETICIONES_HUELLA)
+            {
+                iContRepetirFP = 0;
+
+                if ((iResultadoConsulta = zkfp2.DBMerge(ipDBHandle, byRegistarHuella[0], byRegistarHuella[1], byRegistarHuella[2], byRegTmpTemplateCapturado, ref iRegTmpTamanoCapturado)) == zkfp.ZKFP_ERR_OK &&
+                    (iResultadoConsulta = zkfp2.DBAdd(ipDBHandle, iIdConsecutivoFP, byRegTmpTemplateCapturado)) == zkfp.ZKFP_ERR_OK)
+                {
+                    iIdConsecutivoFP++;
+
+                    sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Huella agregada con éxito";
+                }
+                else
+                {
+                    sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Error al agregar la huella. Error: " + DescripcionDeCodigos((CodigosZKTecho)Enum.ToObject(typeof(CodigosZKTecho), iResultadoConsulta));
+                }
+
+                bRegistrarFP = false;
+                return;
+            }
+            else
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Debe colocar su huela digitial " + (NUMERO_REPETICIONES_HUELLA - iContRepetirFP) + " veces";
+            }
+        }
+
+        /// <summary>
+        /// Identifica/Busca huella digital dentro de la base de datos del dispositivo.
+        /// </summary>
+        public void IdentificarFingerPrint()
+        {
+            iIdRegistradoFP = 0; iCalidadFP = 0;
+
+            iResultadoConsulta = zkfp2.DBIdentify(ipDBHandle, byTemplateCapturadoFP, ref iIdRegistradoFP, ref iCalidadFP);
+
+            if (iResultadoConsulta == zkfp.ZKFP_ERR_OK)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Identificación exitosa. ID de Huella: " + iIdRegistradoFP + " Calidad: " + iCalidadFP.ToString();
+
+                return;
+            }
+            else
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Falló identificación. Error: " + DescripcionDeCodigos((CodigosZKTecho)Enum.ToObject(typeof(CodigosZKTecho), iResultadoConsulta));
+
+                return;
+            }
+        }
+
+        /// <summary>
+        /// Verifica la existencia de la huella capturada en la base de datos
+        /// </summary>
+        public void CoincidenciaFingerPrint()
+        {
+            iResultadoConsulta = zkfp2.DBMatch(ipDBHandle, byTemplateCapturadoFP, byRegTmpTemplateCapturado);
+
+            if (iResultadoConsulta > 0)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Coincidencia encontrada. Calidad: " + iCalidadFP.ToString();
+
+                return;
+            }
+            else
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " No se encontró coincidencia. Error: " + DescripcionDeCodigos((CodigosZKTecho)Enum.ToObject(typeof(CodigosZKTecho), iResultadoConsulta));
+                
+                return;
+            }
+
+        }
+
+        /// <summary>
+        /// Trabaja con la información dentro de la base de datos del dispositivo
+        /// </summary>
+        public void TrabajarFingerPrint()
+        {
+            if (iRegTmpTamanoCapturado <= 0)
+            {
+                sMensajeStatus = DateTime.Now.ToString("hh:mm:ss") + " Registre una huella primero";
+                return;
+            }
+            if (bIdentificaFP)
+            {
+                IdentificarFingerPrint();
+            }
+            else
+            {
+                CoincidenciaFingerPrint();
+            }
+        }
+        
+        /// <summary>
+        /// Hilo de segundo plano que realiza captura de huella digital y responde devuelta al ZKTecho si la lectura se llevo a cabo correctamente
+        /// </summary>
+        private void CapturaFingerPrint()
+        {
+            while (bIniciaCaptura)
+            {
+                iTamanoCapturaTmp = 2048;
+
+                iResultadoConsulta = zkfp2.AcquireFingerprint(ipDevHandle, byBufferImagenFP, byTemplateCapturadoFP, ref iTamanoCapturaTmp);
+
+                if (iResultadoConsulta == zkfp.ZKFP_ERR_OK)
+                {
+                    SendMessage(ipFormHandle, MESSAGE_CAPTURED_OK, IntPtr.Zero, IntPtr.Zero);
+                }
+
+                Thread.Sleep(200);
+            }
+        }
+
+        protected virtual void DefWndProc(ref Message m) //
+        {
+            switch (m.Msg)
+            {
+                case MESSAGE_CAPTURED_OK:
+                    {
+                        CapturaImagenTemplate();
+
+                        if (bRegistrarFP)
+                        {
+                            RegistrarFingerPrint();
+                        }
+                        else
+                        {
+                            TrabajarFingerPrint();
+                        }
+                    }
+                    break;
+
+                default:
+                    DefWndProc(ref m);
+                    break;
+            }
+        }
+
+        #endregion
+    }
+}
